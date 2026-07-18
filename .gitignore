@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Build
+*.dll
+*.tlb
+*.lnk
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini

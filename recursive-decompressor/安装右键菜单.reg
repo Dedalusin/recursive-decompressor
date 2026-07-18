@@ -1,0 +1,11 @@
+Windows Registry Editor Version 5.00
+
+; 为所有文件类型添加「📦 递归解压」右键菜单
+; 使用前请替换路径为实际值
+
+[HKEY_CURRENT_USER\Software\Classes\*\shell\RecursiveDecompress]
+@="📦 递归解压"
+"Icon"="{PYTHON_PATH},0"
+
+[HKEY_CURRENT_USER\Software\Classes\*\shell\RecursiveDecompress\command]
+@="\"{PYTHONW_PATH}\" \"{GUI_PATH}\" \"%1\""
