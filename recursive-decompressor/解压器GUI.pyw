@@ -65,15 +65,42 @@ def _find_7z() -> str | None:
 # ── 压缩包魔数检测 ───────────────────────────────────────────────
 
 ARCHIVE_MAGICS = {
-    "ZIP": (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"),
-    "RAR": (b"Rar!\x1a\x07",),
-    "7Z":  (b"7z\xbc\xaf\x27\x1c",),
+    "ZIP":  (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"),
+    "RAR":  (b"Rar!\x1a\x07",),
+    "7Z":   (b"7z\xbc\xaf\x27\x1c",),
+    "GZIP": (b"\x1f\x8b",),               # .gz .tgz
+    "BZ2":  (b"BZh",),                     # .bz2
 }
+
+def _is_tar_file(filepath: str) -> bool:
+    """检测 tar 文件 (通过 header checksum 验证, tar 无固定魔数)"""
+    try:
+        with open(filepath, "rb") as f:
+            header = f.read(512)
+        if len(header) < 512:
+            return False
+        # 读取 checksum 字段 (offset 148-155, 8字节八进制ASCII)
+        chksum_str = header[148:156]
+        # 必须全是八进制数字或 null/空格
+        for b in chksum_str:
+            if b == 0 or b == 32:  # null or space
+                break
+            if b < 0x30 or b > 0x37:  # '0'-'7'
+                return False
+        if chksum_str[0] == 0:
+            return False  # checksum 全零 = 空 tar
+        return True
+    except Exception:
+        return False
 
 def is_archive(filepath: str) -> bool:
     if archive_type(filepath) is not None:
         return True
-    return _has_appended_zip(filepath)
+    if _has_appended_zip(filepath):
+        return True
+    if _is_tar_file(filepath):
+        return True
+    return False
 
 def archive_type(filepath: str) -> str | None:
     try:
