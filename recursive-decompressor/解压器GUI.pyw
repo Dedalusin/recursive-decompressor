@@ -97,15 +97,16 @@ def _is_tar_file(filepath: str) -> bool:
     except Exception:
         return False
 
-def is_archive(filepath: str) -> bool:
+def is_archive(filepath: str, use_7z_fallback: bool = False) -> bool:
+    """检测是否为压缩包。use_7z_fallback 仅用于用户选择的初始文件"""
     if archive_type(filepath) is not None:
         return True
     if _has_appended_zip(filepath):
         return True
     if _is_tar_file(filepath):
         return True
-    # 7z 启发式回退 (处理 JPEG+7z 等混合文件)
-    if _try_7z_detect(filepath):
+    # 7z 启发式回退 — 慢, 仅用于初始文件
+    if use_7z_fallback and _try_7z_detect(filepath):
         return True
     return False
 
@@ -528,7 +529,7 @@ class DecompressorGUI:
 
     def _run(self, filepath: str, out_dir: str, passwords: list[str]):
         try:
-            if not is_archive(filepath):
+            if not is_archive(filepath, use_7z_fallback=True):
                 self._ui(lambda: self._log("✗ 文件不是支持的压缩包格式"))
                 return
 
