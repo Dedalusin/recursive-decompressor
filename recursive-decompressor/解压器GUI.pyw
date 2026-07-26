@@ -495,6 +495,41 @@ class DecompressorGUI:
         if not filepath:
             messagebox.showwarning("提示", "请先拖入或选择一个文件")
             return
+
+        # 支持目录
+        if os.path.isdir(filepath):
+            items = [os.path.join(filepath, f) for f in os.listdir(filepath)
+                     if os.path.isfile(os.path.join(filepath, f))]
+            if not items:
+                messagebox.showinfo("提示", f"目录为空:\n{filepath}")
+                return
+
+            # 规则1: 只有1个文件 → 直接解压它
+            if len(items) == 1:
+                self.out_var.set(os.path.join(filepath, Path(items[0]).stem))
+                self.file_var.set(items[0])
+                # 递归: 单文件流程
+                filepath = items[0]
+                # fall through to single-file path below
+            else:
+                # 规则2: 检测分卷 (.001 .002) → 用 001 作为入口
+                from pathlib import Path as _Path
+                all_files = [_Path(f) for f in items]
+                if _is_split_archive_parts(all_files):
+                    first = sorted(
+                        [f for f in all_files if _SPLIT_RE.search(f.name)],
+                        key=lambda f: f.name
+                    )[0]
+                    self.out_var.set(os.path.join(filepath, Path(str(first)).stem))
+                    self.file_var.set(str(first))
+                    filepath = str(first)
+                    # fall through to single-file path
+                else:
+                    messagebox.showinfo("提示",
+                        f"目录含 {len(items)} 个文件，非分卷格式，无法自动确定目标。\n"
+                        f"请直接右键点击具体文件。")
+                    return
+
         if not os.path.isfile(filepath):
             messagebox.showerror("错误", f"文件不存在:\n{filepath}")
             return
