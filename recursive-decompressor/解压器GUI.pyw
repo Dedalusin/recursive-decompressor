@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-递归解压器 GUI — 可视化操作界面。
-双击运行, 拖拽文件, 填密码, 一键解压。
-
-支持: ZIP / RAR / 7Z, 任意后缀, 多层嵌套, 分卷压缩, 尾部追加 ZIP
+递归解压器 GUI v2 — 拖拽文件 / 一键解压。
+- 支持从资源管理器拖拽文件到窗口
+- 输出目录默认: 输入文件同目录下, 以输入文件名(去后缀)命名的子目录
 """
 from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -20,7 +18,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk, simpledialog
 
-# ── 拖拽支持 ───────────────────────────────────────────────────
+# ── 拖拽支持 (tkinterdnd2) ─────────────────────────────────────
 
 try:
     from tkinterdnd2 import TkinterDnD
@@ -29,6 +27,7 @@ except ImportError:
     _HAS_DND = False
 
 def get_dropped_file() -> str | None:
+    """检查是否有通过 Explorer 拖拽传入的文件路径"""
     if len(sys.argv) > 1:
         path = sys.argv[1]
         if os.path.isfile(path):
@@ -36,9 +35,12 @@ def get_dropped_file() -> str | None:
     return None
 
 def clean_dnd_path(raw: str) -> str:
+    """清理拖拽传入的路径 (tkinterdnd2 可能用花括号包裹)"""
     path = raw.strip()
+    # Windows 路径如果含空格会被 {...} 包裹
     if path.startswith("{") and path.endswith("}"):
         path = path[1:-1]
+    # 可能带 file:// 前缀
     if path.startswith("file://"):
         path = path[7:]
     return path.strip()
@@ -48,6 +50,8 @@ def clean_dnd_path(raw: str) -> str:
 _7Z_PATHS = [
     r"C:\Program Files\7-Zip\7z.exe",
     r"C:\Program Files (x86)\7-Zip\7z.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Programs\7-Zip\7z.exe"),
+    os.path.expanduser(r"~/scoop/apps/7zip/current/7z.exe"),
     "7z", "7za", "7zz",
 ]
 
@@ -100,9 +104,33 @@ def is_archive(filepath: str) -> bool:
         return True
     if _is_tar_file(filepath):
         return True
+    # 7z 启发式回退 (处理 JPEG+7z 等混合文件)
+    if _try_7z_detect(filepath):
+        return True
     return False
 
+_7z_detect_cache: dict[str, bool] = {}
+
+def _try_7z_detect(filepath: str) -> bool:
+    """让 7z 尝试识别文件 (处理魔数检测无法覆盖的混合格式)"""
+    if filepath in _7z_detect_cache:
+        return _7z_detect_cache[filepath]
+    exe = _find_7z()
+    if not exe:
+        return False
+    try:
+        r = subprocess.run([exe, "l", filepath, "-slt"],
+                           input="\n", capture_output=True, text=True, timeout=10,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+        output = r.stdout + r.stderr
+        is_ok = "Type = " in output or "Cannot open encrypted archive" in output
+        _7z_detect_cache[filepath] = is_ok
+        return is_ok
+    except Exception:
+        return False
+
 def archive_type(filepath: str) -> str | None:
+    """返回压缩包类型: 'ZIP' / 'RAR' / '7Z' / None"""
     try:
         with open(filepath, "rb") as f:
             header = f.read(8)
@@ -114,15 +142,19 @@ def archive_type(filepath: str) -> str | None:
     except Exception:
         return None
 
-# ── 尾部 ZIP 检测 ───────────────────────────────────────────────
+# ── 尾部 ZIP 检测 (MP4+ZIP 混合文件等) ─────────────────────────
+# 某些文件在开头是其他格式(MP4/PNG等), ZIP 数据追加在末尾
 
 def _find_zip_eocd_offset(filepath: str) -> int | None:
+    """在文件末尾 64KB 范围内搜索 ZIP EOCD 签名 (PK\x05\x06),
+    返回 EOCD 在文件中的绝对偏移, 没有则返回 None"""
     try:
         fsize = os.path.getsize(filepath)
         with open(filepath, "rb") as f:
             search_size = min(65536, fsize)
             f.seek(fsize - search_size)
             data = f.read(search_size)
+            # 从后往前搜 PK\x05\x06
             idx = data.rfind(b"PK\x05\x06")
             if idx >= 0:
                 return fsize - search_size + idx
@@ -131,28 +163,34 @@ def _find_zip_eocd_offset(filepath: str) -> int | None:
     return None
 
 def _has_appended_zip(filepath: str) -> bool:
+    """检测文件是否有追加的 ZIP 数据 (头部不是 ZIP 但尾部有)"""
     if archive_type(filepath) is not None:
-        return False
+        return False  # 头就是压缩包, 不是追加模式
     return _find_zip_eocd_offset(filepath) is not None
 
-# ── 分卷检测 ────────────────────────────────────────────────────
+# ── 解压 ─────────────────────────────────────────────────────────
 
+import re
+
+# 分卷压缩包特征: .001 .002 ... / .r00 .r01 ... / .part1.rar .part2.rar ...
 _SPLIT_RE = re.compile(
     r'\.(?:0\d{2}|[1-9]\d{2,}|r\d{2}|part\d+\.rar|z\d{2})$',
     re.IGNORECASE
 )
 
 def _is_split_archive_parts(files: list[Path]) -> bool:
+    """检测文件列表是否全为分卷压缩包的一部分"""
     if len(files) < 2:
         return False
+    # 如果有 .001 或 .r00 存在, 就是分卷
     return any(_SPLIT_RE.search(f.name) for f in files)
 
-# ── 解压 ─────────────────────────────────────────────────────────
-
 def _extract_zip(filepath: str, dest: str, passwords: list[str]) -> tuple[bool, str | None]:
+    """(成功, 使用的密码或None=无密码)"""
     exe = _find_7z()
     is_appended = _has_appended_zip(filepath)
 
+    # 尾部追加 ZIP → 优先用 Python zipfile (7z 可能无法处理)
     if is_appended:
         for pwd in [None] + passwords:
             try:
@@ -168,7 +206,9 @@ def _extract_zip(filepath: str, dest: str, passwords: list[str]) -> tuple[bool, 
                 continue
         return False, None
 
+    # 普通压缩包 → 用 7z
     if exe:
+        # 无密码
         try:
             r = subprocess.run([exe, "x", filepath, f"-o{dest}", "-y"],
                                capture_output=True, text=True, timeout=120,
@@ -177,6 +217,7 @@ def _extract_zip(filepath: str, dest: str, passwords: list[str]) -> tuple[bool, 
                 return True, None
         except Exception:
             pass
+        # 带密码
         for pwd in passwords:
             try:
                 r = subprocess.run([exe, "x", filepath, f"-o{dest}", "-y", f"-p{pwd}"],
@@ -186,6 +227,7 @@ def _extract_zip(filepath: str, dest: str, passwords: list[str]) -> tuple[bool, 
                     return True, pwd
             except Exception:
                 pass
+            # zipfile 回退
             try:
                 import zipfile
                 with zipfile.ZipFile(filepath, "r") as zf:
@@ -236,29 +278,36 @@ class DecompressorGUI:
 
         self._build_ui()
 
+        # 拖拽支持 — tkinterdnd2 窗口内拖入
         if _HAS_DND:
             self.root.drop_target_register("*")
             self.root.dnd_bind("<<Drop>>", self._on_window_drop)
             self.drop_zone.drop_target_register("*")
             self.drop_zone.dnd_bind("<<Drop>>", self._on_window_drop)
 
+        # 检查是否通过 Explorer 拖拽启动
         dropped = get_dropped_file()
         if dropped:
             self.root.after(100, lambda: self._set_input_file(dropped))
 
+        # 关闭时清理
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _set_input_file(self, filepath: str):
+        """设置输入文件并自动推导输出目录"""
         self.file_var.set(filepath)
+        # 输出目录: {输入文件所在目录}/{输入文件名(去后缀)}/
         parent = os.path.dirname(filepath)
         stem = Path(filepath).stem
         out_dir = os.path.join(parent, stem)
         self.out_var.set(out_dir)
+        # 更新拖拽区域显示
         fname = os.path.basename(filepath)
         self.drop_label.configure(text=f"📄 {fname}")
         self.drop_hint.configure(text="点击更换文件 | 或继续拖入新文件")
 
     def _on_window_drop(self, event):
+        """窗口内拖拽文件事件"""
         path = clean_dnd_path(event.data)
         if os.path.isfile(path):
             self._set_input_file(path)
@@ -266,30 +315,34 @@ class DecompressorGUI:
     # ── UI 构建 ───────────────────────────────────────────────
 
     def _build_ui(self):
+        # 标题
         tk.Label(self.root, text="📦 递归解压器",
                  font=("Microsoft YaHei UI", 18, "bold"),
                  bg=BG, fg=ACCENT).pack(pady=(16, 2))
         tk.Label(self.root, text="拖入文件 → 填密码 → 一键解压到底",
                  font=("Microsoft YaHei UI", 9), bg=BG, fg=DIM).pack(pady=(0, 12))
 
+        # ── 拖拽区域 ──
         self.drop_zone = tk.Frame(self.root, bg=SURFACE, highlightbackground=ACCENT,
                                    highlightthickness=2, cursor="hand2")
         self.drop_zone.pack(fill="x", padx=20, pady=4, ipady=14)
         self.drop_zone.bind("<Button-1>", lambda e: self._browse_file())
+        # 让内部 label 也响应点击
         self.drop_label = tk.Label(self.drop_zone,
                                     text="📁  拖拽文件到此处 或 点击选择文件",
                                     font=("Microsoft YaHei UI", 13),
                                     bg=SURFACE, fg=ACCENT, cursor="hand2")
         self.drop_label.pack(pady=(10, 2))
         self.drop_label.bind("<Button-1>", lambda e: self._browse_file())
-        self.drop_hint = tk.Label(self.drop_zone, 
-                                   text="支持 zip / rar / 7z, 任意后缀, 自动识别魔数",
+        self.drop_hint = tk.Label(self.drop_zone, text="支持 zip / rar / 7z, 任意后缀 (.jpg .png .bin 无后缀等), 自动识别魔数",
                                    font=("Microsoft YaHei UI", 8), bg=SURFACE, fg=DIM, cursor="hand2")
         self.drop_hint.pack(pady=(0, 8))
         self.drop_hint.bind("<Button-1>", lambda e: self._browse_file())
 
+        # 隐藏的输入文件变量
         self.file_var = tk.StringVar()
 
+        # ── 输出目录 ──
         out_frame = tk.Frame(self.root, bg=BG)
         out_frame.pack(fill="x", padx=20, pady=(8, 2))
         tk.Label(out_frame, text="📂 输出目录", font=("Microsoft YaHei UI", 10),
@@ -304,8 +357,8 @@ class DecompressorGUI:
         tk.Button(out_row, text="更改...", command=self._browse_out,
                   bg=BTN_BG, fg=FG, relief="flat", cursor="hand2",
                   font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(6, 0))
-        self._add_context_menu(self.out_entry)
 
+        # ── 密码 ──
         pwd_frame = tk.Frame(self.root, bg=BG)
         pwd_frame.pack(fill="x", padx=20, pady=(8, 2))
         tk.Label(pwd_frame, text="🔑 密码 (每行一个, 顺序无所谓, 成功过的自动缓存)",
@@ -314,8 +367,11 @@ class DecompressorGUI:
                                 bg=SURFACE, fg=FG, insertbackground=FG,
                                 relief="flat", wrap="none")
         self.pwd_text.pack(fill="x", pady=2)
+        # 右键菜单
         self._add_context_menu(self.pwd_text)
+        self._add_context_menu(self.out_entry)
 
+        # ── 按钮 ──
         btn_frame = tk.Frame(self.root, bg=BG)
         btn_frame.pack(fill="x", padx=20, pady=8)
         self.go_btn = tk.Button(btn_frame, text="▶  开始解压", command=self._start,
@@ -329,9 +385,11 @@ class DecompressorGUI:
                                     state="disabled")
         self.cancel_btn.pack(side="left", padx=8)
 
+        # 进度条
         self.progress = ttk.Progressbar(self.root, mode="indeterminate")
         self.progress.pack(fill="x", padx=20, pady=2)
 
+        # ── 日志 ──
         log_frame = tk.Frame(self.root, bg=BG)
         log_frame.pack(fill="both", expand=True, padx=20, pady=(4, 12))
         tk.Label(log_frame, text="📋 运行日志", font=("Microsoft YaHei UI", 10),
@@ -346,12 +404,13 @@ class DecompressorGUI:
         self.log_text.configure(yscrollcommand=scrollbar.set)
         self._add_context_menu(self.log_text)
 
+        # 状态栏
         self.status_var = tk.StringVar(value="就绪 — 拖入文件或点击上方区域选择文件")
         tk.Label(self.root, textvariable=self.status_var,
                  font=("Microsoft YaHei UI", 8), bg="#11111b", fg=DIM,
                  anchor="w", padx=12, pady=4).pack(fill="x", side="bottom")
 
-    # ── 日志 / 右键菜单 ────────────────────────────────────────
+    # ── 日志 / 状态 ───────────────────────────────────────────
 
     def _log(self, msg: str):
         self.log_text.configure(state="normal")
@@ -362,7 +421,20 @@ class DecompressorGUI:
     def _set_status(self, msg: str):
         self.status_var.set(msg)
 
+    # ── 交互 ──────────────────────────────────────────────────
+
+    def _browse_file(self):
+        path = filedialog.askopenfilename(title="选择要解压的文件")
+        if path:
+            self._set_input_file(path)
+
+    def _browse_out(self):
+        path = filedialog.askdirectory(title="选择输出目录")
+        if path:
+            self.out_var.set(path)
+
     def _add_context_menu(self, widget):
+        """为输入框添加右键菜单 (粘贴/复制/剪切)"""
         menu = tk.Menu(widget, tearoff=0, bg=SURFACE, fg=FG,
                        activebackground=ACCENT, activeforeground="#1e1e2e",
                        font=("Microsoft YaHei UI", 9))
@@ -370,10 +442,11 @@ class DecompressorGUI:
         menu.add_command(label="复制", command=lambda: self._copy_from(widget))
         menu.add_separator()
         menu.add_command(label="全选", command=lambda: self._select_all(widget))
+
         def show_menu(event):
             menu.tk_popup(event.x_root, event.y_root)
-        widget.bind("<Button-3>", show_menu)
-        widget.bind("<Button-2>", show_menu)
+        widget.bind("<Button-3>", show_menu)  # Windows 右键
+        widget.bind("<Button-2>", show_menu)  # macOS/Linux 中键
 
     def _paste_to(self, widget):
         try:
@@ -401,18 +474,6 @@ class DecompressorGUI:
             widget.tag_add("sel", "1.0", "end")
         else:
             widget.select_range(0, "end")
-
-    # ── 交互 ──────────────────────────────────────────────────
-
-    def _browse_file(self):
-        path = filedialog.askopenfilename(title="选择要解压的文件")
-        if path:
-            self._set_input_file(path)
-
-    def _browse_out(self):
-        path = filedialog.askdirectory(title="选择输出目录")
-        if path:
-            self.out_var.set(path)
 
     def _cancel(self):
         self._cancelled = True
@@ -451,6 +512,7 @@ class DecompressorGUI:
         self.go_btn.configure(state="disabled", bg="#585b70")
         self.cancel_btn.configure(state="normal")
         self.progress.start(10)
+        # 清日志
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
@@ -470,6 +532,7 @@ class DecompressorGUI:
                 self._ui(lambda: self._log("✗ 文件不是支持的压缩包格式"))
                 return
 
+            # 提示尾部追加 ZIP 等特殊格式
             if _has_appended_zip(filepath):
                 self._ui(lambda: self._log("🔍 检测到尾部追加 ZIP (头部是视频/图片等格式)"))
 
@@ -498,6 +561,7 @@ class DecompressorGUI:
 
                 if not ok:
                     self._ui(lambda k=known, l=layers, d=dname: self._log(f"│ 密码不足, 已尝试: {k}"))
+                    # 弹窗问密码
                     pwd_result = {}
                     _layers = layers
                     _dname = dname
@@ -509,6 +573,7 @@ class DecompressorGUI:
                         )
                         pwd_result["pwd"] = p
                     self._ui(_ask)
+                    import time
                     for _ in range(100):
                         if "pwd" in pwd_result:
                             break
@@ -517,7 +582,7 @@ class DecompressorGUI:
                     if not user_pwd:
                         self._ui(lambda: self._log("│ ✗ 跳过 (无密码)"))
                         break
-                    self._ui(lambda: self._log("│ 尝试用户输入密码..."))
+                    self._ui(lambda: self._log(f"│ 尝试用户输入密码..."))
                     ok2, p2 = _extract_zip(current, tmpdir, [user_pwd])
                     if not ok2:
                         self._ui(lambda: self._log("│ ✗ 密码错误"))
@@ -536,15 +601,18 @@ class DecompressorGUI:
                 total = sum(1 for _ in Path(tmpdir).rglob("*") if _.is_file())
                 self._ui(lambda t=total, z=len(zips): self._log(f"│ 解出 {t} 个文件, {z} 个是压缩包"))
 
+                # 检测是否为分卷压缩包 (.001 .002 .r00 等)
                 all_files = [f for f in Path(tmpdir).rglob("*") if f.is_file()]
                 is_split = _is_split_archive_parts(all_files)
                 if is_split:
                     self._ui(lambda: self._log("│ 🔗 检测到分卷压缩包, 继续解压"))
 
+                # 终止条件: 不是分卷 + (文件数≥2 或 无更多压缩包)
                 if not is_split and (total >= 2 or not zips):
                     if total >= 2:
                         self._ui(lambda: self._log("│ ⏹ 文件数≥2, 停止递归 (保留内层压缩包不解压)"))
 
+                    # 展平中间包裹层: A/B/C/D → 只保留 D
                     source_dir = Path(tmpdir)
                     while True:
                         items = list(source_dir.iterdir())
@@ -564,9 +632,11 @@ class DecompressorGUI:
                             shutil.copy2(item, dest)
                     break
 
+                # 选下一个要解压的文件: 优先压缩包, 分卷则选第一片
                 if zips:
                     current = zips[0]
                 elif is_split:
+                    # 找 .001 或 .r00 作为入口
                     first_part = sorted(
                         [f for f in all_files if _SPLIT_RE.search(f.name)],
                         key=lambda f: f.name
@@ -579,6 +649,7 @@ class DecompressorGUI:
                 else:
                     break
 
+            # 结果
             final_files = []
             if final_output.exists():
                 final_files = sorted(
@@ -593,7 +664,9 @@ class DecompressorGUI:
                 *[self._log(f"   → {os.path.basename(f)}") for f in ff],
                 self._log(f"{'='*50}"),
                 self._set_status(f"完成 — {l} 层解压, {len(ff)} 个文件 → {fo}"),
+                # 询问是否删除原文件
                 self._ask_delete_original(fp),
+                # 关闭窗口
                 self.root.after(500, self.root.destroy),
             ])
 
@@ -612,6 +685,7 @@ class DecompressorGUI:
                     pass
 
     def _ui(self, fn):
+        """在线程安全地在 UI 线程执行"""
         self.root.after(0, fn)
 
     def _finish(self):
@@ -620,6 +694,7 @@ class DecompressorGUI:
         self.cancel_btn.configure(state="disabled")
 
     def _ask_delete_original(self, filepath: str):
+        """解压成功后询问是否删除原文件"""
         fname = os.path.basename(filepath)
         if messagebox.askyesno("解压完成", f"是否删除原文件?\n\n{fname}", parent=self.root):
             try:
