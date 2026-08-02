@@ -186,66 +186,119 @@ def _is_split_archive_parts(files: list[Path]) -> bool:
     # 如果有 .001 或 .r00 存在, 就是分卷
     return any(_SPLIT_RE.search(f.name) for f in files)
 
-def _extract_zip(filepath: str, dest: str, passwords: list[str]) -> tuple[bool, str | None]:
-    """(成功, 使用的密码或None=无密码)"""
+def _extract_appended_zip(filepath: str, dest: str, password: str | None,
+                         progress_cb=None, cancel_check=None, proc_holder=None) -> bool:
+    """提取尾部追加 ZIP: 切出 ZIP 数据用 7z (快速) 或回退 zipfile"""
+    exe = _find_7z()
+    if not exe:
+        return False
+
+    import struct
+    try:
+        fsize = os.path.getsize(filepath)
+        import zipfile as zf_mod
+        with zf_mod.ZipFile(filepath, "r") as zf:
+            infos = zf.infolist()
+            if not infos:
+                return False
+            first_offset = infos[0].header_offset
+
+        zip_tmp = os.path.join(os.path.dirname(dest), f"_zip_slice_{os.getpid()}.zip")
+        with open(filepath, "rb") as src, open(zip_tmp, "wb") as dst:
+            src.seek(first_offset)
+            remaining = fsize - first_offset
+            chunk = 8 * 1024 * 1024
+            while remaining > 0:
+                data = src.read(min(chunk, remaining))
+                if not data:
+                    break
+                dst.write(data)
+                remaining -= len(data)
+
+        cmd = [exe, "x", zip_tmp, f"-o{dest}", "-y", "-bsp1"]
+        if password:
+            cmd.append(f"-p{password}")
+        ok = _run_7z_with_progress(cmd, progress_cb, cancel_check=cancel_check,
+                                   proc_holder=proc_holder)
+        os.unlink(zip_tmp)
+        return ok
+    except Exception:
+        return False
+
+def _extract_zip(filepath: str, dest: str, passwords: list[str],
+                 progress_cb=None, cancel_check=None, proc_holder=None) -> tuple[bool, str | None]:
+    """(成功, 使用的密码或None=无密码). progress_cb(percent: int) 可选"""
     exe = _find_7z()
     is_appended = _has_appended_zip(filepath)
 
-    # 尾部追加 ZIP → 优先用 Python zipfile (7z 可能无法处理)
+    # 尾部追加 ZIP → 切出数据用 7z
     if is_appended:
         for pwd in [None] + passwords:
-            try:
-                import zipfile as zf_mod
-                with zf_mod.ZipFile(filepath, "r") as zf:
-                    zf.extractall(dest, pwd=pwd.encode("utf-8") if pwd else None)
+            if _extract_appended_zip(filepath, dest, pwd, progress_cb, cancel_check, proc_holder):
                 return True, pwd
-            except RuntimeError as e:
-                if "password" in str(e).lower():
-                    continue
-                return False, None
-            except Exception:
-                continue
         return False, None
 
-    # 普通压缩包 → 用 7z
+    # 普通压缩包 → 用 7z 流式读取进度
     if exe:
-        # 无密码
-        try:
-            r = subprocess.run([exe, "x", filepath, f"-o{dest}", "-y"],
-                               capture_output=True, text=True, timeout=120,
-                               creationflags=subprocess.CREATE_NO_WINDOW)
-            if r.returncode == 0:
-                return True, None
-        except Exception:
-            pass
-        # 带密码
-        for pwd in passwords:
+        for pwd in [None] + passwords:
+            cmd = [exe, "x", filepath, f"-o{dest}", "-y", "-bsp1"]
+            if pwd:
+                cmd.append(f"-p{pwd}")
             try:
-                r = subprocess.run([exe, "x", filepath, f"-o{dest}", "-y", f"-p{pwd}"],
-                                   capture_output=True, text=True, timeout=120,
-                                   creationflags=subprocess.CREATE_NO_WINDOW)
-                if r.returncode == 0:
+                ok = _run_7z_with_progress(cmd, progress_cb,
+                                           input_data="\n" if not pwd else None,
+                                           cancel_check=cancel_check,
+                                           proc_holder=proc_holder)
+                if ok:
                     return True, pwd
-            except Exception:
-                pass
-            # zipfile 回退
-            try:
-                import zipfile
-                with zipfile.ZipFile(filepath, "r") as zf:
-                    zf.extractall(dest, pwd=pwd.encode("utf-8"))
-                return True, pwd
             except Exception:
                 pass
     return False, None
 
-def scan_for_archives(directory: str) -> list[str]:
-    results = []
-    for root, dirs, files in os.walk(directory):
-        for fname in files:
-            fpath = os.path.join(root, fname)
-            if is_archive(fpath):
-                results.append(fpath)
-    return results
+def _run_7z_with_progress(cmd: list, progress_cb, input_data=None,
+                          cancel_check=None, proc_holder=None) -> bool:
+    """运行 7z 并解析进度, 返回是否成功"""
+    import re as _re
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        stdin=subprocess.PIPE if input_data else None,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    if proc_holder is not None:
+        proc_holder(proc)
+    if input_data:
+        proc.stdin.write(input_data.encode("utf-8", errors="replace"))
+        proc.stdin.close()
+
+    last_pct = -1
+    remainder = b""
+    while True:
+        if cancel_check and cancel_check():
+            proc.kill()
+            proc.wait()
+            return False
+        chunk = proc.stdout.read(8192)
+        if not chunk:
+            break
+        data = remainder + chunk
+        *lines, remainder = data.replace(b"\r", b"\n").split(b"\n")
+        for line_bytes in lines:
+            line = line_bytes.decode("utf-8", errors="replace")
+            m = _re.search(r'(\d{1,3})\s*%', line)
+            if m and progress_cb:
+                pct = int(m.group(1))
+                if pct != last_pct:
+                    progress_cb(pct)
+                    last_pct = pct
+    if remainder:
+        line = remainder.decode("utf-8", errors="replace")
+        m = _re.search(r'(\d{1,3})\s*%', line)
+        if m and progress_cb:
+            pct = int(m.group(1))
+            if pct != last_pct:
+                progress_cb(pct)
+    proc.wait(timeout=600)
+    return proc.returncode in (0, 1)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -276,6 +329,8 @@ class DecompressorGUI:
         self._cancelled = False
         self.known_passwords: list[str] = []
         self.temp_dirs: list[str] = []
+        self._current_proc = None  # 当前 7z 子进程, 用于取消
+        self._progress_determinate = False  # 进度条是否已切为确定模式
 
         self._build_ui()
 
@@ -478,9 +533,22 @@ class DecompressorGUI:
 
     def _cancel(self):
         self._cancelled = True
+        self._log("⚠ 正在取消...")
+        self.progress.stop()
+        self.progress.configure(mode="indeterminate")
+        if self._current_proc:
+            try:
+                self._current_proc.kill()
+            except Exception:
+                pass
 
     def _on_close(self):
         self._cancelled = True
+        if self._current_proc:
+            try:
+                self._current_proc.kill()
+            except Exception:
+                pass
         for d in self.temp_dirs:
             try:
                 shutil.rmtree(d, ignore_errors=True)
@@ -570,32 +638,54 @@ class DecompressorGUI:
 
             # 提示尾部追加 ZIP 等特殊格式
             if _has_appended_zip(filepath):
-                self._ui(lambda: self._log("🔍 检测到尾部追加 ZIP (头部是视频/图片等格式)"))
+                fsize_mb = os.path.getsize(filepath) / 1024 / 1024
+                self._ui(lambda s=fsize_mb: (
+                    self._log(f"🔍 检测到尾部追加 ZIP ({s:.0f} MB, 头部是视频/图片)"),
+                    self._log("⏳ 大文件解密提取较慢, 请耐心等待...") if s > 500 else None,
+                ))
 
             known = list(passwords)
             layers = 0
             current = filepath
             final_output = Path(out_dir)
+            success = False  # 只有正常终止才为 True
+
+            # 进度回调 (线程安全, 更新进度条和日志)
+            def _progress(pct: int):
+                def _update(p=pct, l=layers):
+                    self._set_status(f"正在解压第 {l} 层... {p}%")
+                    self._set_progress(p)
+                    # 每 20% 在日志中也输出一次
+                    if p % 20 == 0:
+                        self._log(f"│ 进度: {p}%")
+                self._ui(_update)
 
             while not self._cancelled:
+                if self._cancelled:
+                    break
                 layers += 1
                 dname = os.path.basename(current) or "(无后缀)"
 
-                self._ui(lambda l=layers, d=dname: [
+                self._ui(lambda l=layers, d=dname, c=current: [
                     self._log(""),
-                    self._log(f"┌─ 第 {l} 层: {d}"),
+                    self._log(f"┌─ 第 {l} 层: {d} ({os.path.getsize(c)/1024/1024:.0f} MB)"),
                     self._set_status(f"正在解压第 {l} 层..."),
                 ])
 
-                tmpdir = tempfile.mkdtemp(prefix=f"unzip_L{layers}_")
+                tmpdir = str(final_output) + f"_temp_L{layers}"
+                os.makedirs(tmpdir, exist_ok=True)
                 self.temp_dirs.append(tmpdir)
 
                 if known:
                     self._ui(lambda k=known: self._log(f"│ 尝试密码: {k[:4]}{'...' if len(k)>4 else ''}"))
 
-                ok, used_pwd = _extract_zip(current, tmpdir, known)
+                ok, used_pwd = _extract_zip(current, tmpdir, known, _progress,
+                                           cancel_check=lambda: self._cancelled,
+                                           proc_holder=lambda p: setattr(self, '_current_proc', p))
 
                 if not ok:
+                    if self._cancelled:
+                        break
                     self._ui(lambda k=known, l=layers, d=dname: self._log(f"│ 密码不足, 已尝试: {k}"))
                     # 弹窗问密码
                     pwd_result = {}
@@ -609,17 +699,18 @@ class DecompressorGUI:
                         )
                         pwd_result["pwd"] = p
                     self._ui(_ask)
+                    # 等用户响应 (无超时, simpledialog 是阻塞的)
                     import time
-                    for _ in range(100):
-                        if "pwd" in pwd_result:
-                            break
+                    while "pwd" not in pwd_result:
                         time.sleep(0.1)
-                    user_pwd = pwd_result.get("pwd")
+                    user_pwd = (pwd_result.get("pwd") or "").strip()
                     if not user_pwd:
-                        self._ui(lambda: self._log("│ ✗ 跳过 (无密码)"))
+                        self._ui(lambda: self._log("│ ✗ 跳过"))
                         break
                     self._ui(lambda: self._log(f"│ 尝试用户输入密码..."))
-                    ok2, p2 = _extract_zip(current, tmpdir, [user_pwd])
+                    ok2, p2 = _extract_zip(current, tmpdir, [user_pwd], _progress,
+                                           cancel_check=lambda: self._cancelled,
+                                           proc_holder=lambda p: setattr(self, '_current_proc', p))
                     if not ok2:
                         self._ui(lambda: self._log("│ ✗ 密码错误"))
                         break
@@ -633,48 +724,93 @@ class DecompressorGUI:
                 else:
                     self._ui(lambda: self._log("│ ✓ 无密码"))
 
-                zips = scan_for_archives(tmpdir)
-                total = sum(1 for _ in Path(tmpdir).rglob("*") if _.is_file())
-                self._ui(lambda t=total, z=len(zips): self._log(f"│ 解出 {t} 个文件, {z} 个是压缩包"))
+                # ── 决策: 继续解压还是停止 ──────────────────────
+                # 先扫描顶层
+                top_items = list(Path(tmpdir).iterdir())
+                top_files = [f for f in top_items if f.is_file()]
+                top_dirs = [d for d in top_items if d.is_dir()]
+                zips = [f for f in top_files if is_archive(str(f))]
+                total = len(top_items)
+                self._ui(lambda t=total, z=len(zips): self._log(f"│ 解出 {t} 项 ({len(top_files)} 文件, {len(top_dirs)} 目录), {len(zips)} 个压缩包"))
 
-                # 检测是否为分卷压缩包 (.001 .002 .r00 等)
-                all_files = [f for f in Path(tmpdir).rglob("*") if f.is_file()]
-                is_split = _is_split_archive_parts(all_files)
+                # 1. 如果只有 1 个目录 → 穿透进去看里面的内容
+                inner_dir = None
+                if len(top_items) == 1 and top_dirs:
+                    inner_dir = top_dirs[0]
+                    top_items = list(inner_dir.iterdir())
+                    top_files = [f for f in top_items if f.is_file()]
+                    top_dirs = [d for d in top_items if d.is_dir()]
+                    zips = [f for f in top_files if is_archive(str(f))]
+                    total = len(top_items)
+                    self._ui(lambda t=total, z=len(zips): self._log(f"│ ↳ 穿透目录, 内共 {t} 项 ({len(top_files)} 文件, {len(top_dirs)} 目录), {len(zips)} 个压缩包"))
+
+                # 2. 分卷检测
+                is_split = _is_split_archive_parts(top_files)
                 if is_split:
                     self._ui(lambda: self._log("│ 🔗 检测到分卷压缩包, 继续解压"))
 
-                # 终止条件: 不是分卷 + (文件数≥2 或 无更多压缩包)
-                if not is_split and (total >= 2 or not zips):
-                    if total >= 2:
-                        self._ui(lambda: self._log("│ ⏹ 文件数≥2, 停止递归 (保留内层压缩包不解压)"))
+                # 3. 终止判断:
+                #    - 有子目录 → 真实内容, 停
+                #    - ≥2 个普通文件 → 真实内容, 停
+                #    - 无压缩包 → 到底了, 停
+                #    - 1 个压缩包 → 继续解压
+                should_stop = False
+                stop_reason = ""
+                if is_split:
+                    should_stop = False
+                elif top_dirs:
+                    should_stop = True
+                    stop_reason = "包含子目录"
+                elif total >= 2 and not zips:
+                    should_stop = True
+                    stop_reason = f"{total} 个文件均非压缩包"
+                elif total >= 2 and zips:
+                    # 有多个文件, 其中有些是压缩包 — 但仍应停止 (混合内容 = 真实内容)
+                    should_stop = True
+                    stop_reason = f"{total} 个文件 (含 {len(zips)} 个压缩包), 混合内容视为最终"
+                elif total == 1 and not zips:
+                    should_stop = True
+                    stop_reason = "单文件非压缩包"
+                elif not zips and total == 0:
+                    should_stop = True
+                    stop_reason = "空目录"
+                # else: 1 file that IS a zip → continue
 
-                    # 展平中间包裹层: A/B/C/D → 只保留 D
-                    source_dir = Path(tmpdir)
+                if should_stop:
+                    self._ui(lambda r=stop_reason: self._log(f"│ ⏹ {r}, 停止递归"))
+
+                    # 展平中间包裹层
+                    source_dir = inner_dir if inner_dir else Path(tmpdir)
+                    # 展平: 穿透单层目录包裹
                     while True:
                         items = list(source_dir.iterdir())
                         if len(items) == 1 and items[0].is_dir():
                             source_dir = items[0]
                         else:
-                            break
+                            break  # 0项(空目录) 或 ≥2项 或 单文件 → 停止
 
+                    self._ui(lambda: self._log("│ 📁 正在复制最终文件..."))
                     final_output.mkdir(parents=True, exist_ok=True)
                     for item in source_dir.iterdir():
                         dest = final_output / item.name
                         if item.is_dir():
                             if dest.exists():
                                 shutil.rmtree(dest)
+                            self._ui(lambda n=item.name: self._log(f"│   → {n}/"))
                             shutil.copytree(item, dest)
                         else:
+                            self._ui(lambda n=item.name: self._log(f"│   → {n}"))
                             shutil.copy2(item, dest)
+                    self._ui(lambda: self._log("│ 📁 复制完成"))
+                    success = True
                     break
 
-                # 选下一个要解压的文件: 优先压缩包, 分卷则选第一片
+                # 选下一个要解压的文件
                 if zips:
-                    current = zips[0]
+                    current = str(zips[0])
                 elif is_split:
-                    # 找 .001 或 .r00 作为入口
                     first_part = sorted(
-                        [f for f in all_files if _SPLIT_RE.search(f.name)],
+                        [f for f in top_files if _SPLIT_RE.search(f.name)],
                         key=lambda f: f.name
                     )
                     if first_part:
@@ -685,26 +821,43 @@ class DecompressorGUI:
                 else:
                     break
 
-            # 结果
-            final_files = []
-            if final_output.exists():
-                final_files = sorted(
-                    str(f) for f in final_output.rglob("*") if f.is_file()
-                )
+                # 清理上一层的临时目录, 释放磁盘空间
+                if len(self.temp_dirs) > 1:
+                    old = self.temp_dirs.pop(0)
+                    try:
+                        shutil.rmtree(old, ignore_errors=True)
+                    except Exception:
+                        pass
 
-            self._ui(lambda l=layers, ff=final_files, fo=final_output, fp=filepath: [
-                self._log(""),
-                self._log(f"{'='*50}"),
-                self._log(f"✅ 完成! 共 {l} 层, {len(ff)} 个最终文件"),
-                self._log(f"   输出: {fo}"),
-                *[self._log(f"   → {os.path.basename(f)}") for f in ff],
-                self._log(f"{'='*50}"),
-                self._set_status(f"完成 — {l} 层解压, {len(ff)} 个文件 → {fo}"),
-                # 询问是否删除原文件
-                self._ask_delete_original(fp),
-                # 关闭窗口
-                self.root.after(500, self.root.destroy),
-            ])
+            # 结果: 只统计不列举
+            if success:
+                final_files = []
+                if final_output.exists():
+                    final_files = [f for f in final_output.iterdir()]
+
+                self._ui(lambda l=layers, ff=final_files, fo=final_output, fp=filepath: [
+                    self._log(""),
+                    self._log(f"{'='*50}"),
+                    self._log(f"✅ 完成! 共 {l} 层, {len(ff)} 个最终文件/目录"),
+                    self._log(f"   输出: {fo}"),
+                    self._log(f"{'='*50}"),
+                    self._set_status(f"完成 — {l} 层解压 → {fo}"),
+                    self._ask_delete_original(fp),
+                    self.root.after(500, self.root.destroy),
+                ])
+            else:
+                # 失败时保留当前层文件到输出目录
+                if current and os.path.isfile(current):
+                    final_output.mkdir(parents=True, exist_ok=True)
+                    preserved = os.path.join(str(final_output), os.path.basename(current))
+                    try:
+                        shutil.copy2(current, preserved)
+                        self._ui(lambda p=preserved: self._log(f"📁 失败层文件已保留: {os.path.basename(p)}"))
+                    except Exception:
+                        pass
+                self._ui(lambda: [
+                    self._set_status("解压中断 — 窗口保持, 请查看日志"),
+                ])
 
         except Exception as e:
             self._ui(lambda e=e: [
@@ -726,8 +879,18 @@ class DecompressorGUI:
 
     def _finish(self):
         self.progress.stop()
+        self.progress.configure(mode="indeterminate")
+        self._progress_determinate = False
         self.go_btn.configure(state="normal", bg=GREEN)
         self.cancel_btn.configure(state="disabled")
+
+    def _set_progress(self, pct: int):
+        """更新进度条为确定百分比模式"""
+        if not self._progress_determinate:
+            self.progress.stop()
+            self.progress.configure(mode="determinate", maximum=100)
+            self._progress_determinate = True
+        self.progress.configure(value=pct)
 
     def _ask_delete_original(self, filepath: str):
         """解压成功后询问是否删除原文件"""
