@@ -18,6 +18,50 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk, simpledialog
 
+# ── 密码缓存 ─────────────────────────────────────────────────────
+
+_PWD_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "password_cache.json")
+
+def _load_password_cache() -> list[str]:
+    """加载历史密码 (按最近使用降序)"""
+    try:
+        with open(_PWD_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        entries = data.get("passwords", [])
+        entries.sort(key=lambda e: e.get("last_used", 0), reverse=True)
+        return [e["pwd"] for e in entries]
+    except Exception:
+        return []
+
+def _save_password_to_cache(pwd: str):
+    """记录成功密码到历史缓存"""
+    try:
+        with open(_PWD_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {"passwords": []}
+    entries = data.get("passwords", [])
+    for e in entries:
+        if e["pwd"] == pwd:
+            e["count"] = e.get("count", 1) + 1
+            e["last_used"] = time.time()
+            break
+    else:
+        entries.append({"pwd": pwd, "count": 1, "last_used": time.time()})
+    data["passwords"] = entries[:50]  # 最多保留 50 个
+    try:
+        with open(_PWD_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def _add_manual_password(pwd: str):
+    """手动添加密码到缓存"""
+    if not pwd:
+        return
+    _save_password_to_cache(pwd)
+
 # ── 拖拽支持 (tkinterdnd2) ─────────────────────────────────────
 
 try:
@@ -66,6 +110,29 @@ def _find_7z() -> str | None:
             continue
     return None
 
+# ── LZ4 工具路径探测 ────────────────────────────────────────────
+
+_LZ4_PATHS = [
+    # 工具同目录 (推荐: 把 lz4.exe 复制到工具目录)
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "lz4.exe"),
+    os.environ.get("LZ4_EXE", ""),
+    r"C:\Program Files\lz4\lz4.exe",
+    r"C:\Program Files (x86)\lz4\lz4.exe",
+]
+
+def _find_lz4() -> str | None:
+    for p in _LZ4_PATHS:
+        if not p:
+            continue
+        try:
+            r = subprocess.run([p, "--version"], capture_output=True, timeout=5,
+                               creationflags=subprocess.CREATE_NO_WINDOW)
+            if r.returncode == 0:
+                return p
+        except Exception:
+            continue
+    return None
+
 # ── 压缩包魔数检测 ───────────────────────────────────────────────
 
 ARCHIVE_MAGICS = {
@@ -74,6 +141,7 @@ ARCHIVE_MAGICS = {
     "7Z":   (b"7z\xbc\xaf\x27\x1c",),
     "GZIP": (b"\x1f\x8b",),               # .gz .tgz
     "BZ2":  (b"BZh",),                     # .bz2
+    "LZ4":  (b"\x04\x22\x4d\x18",),        # LZ4 frame
 }
 
 def _is_tar_file(filepath: str) -> bool:
@@ -225,11 +293,66 @@ def _extract_appended_zip(filepath: str, dest: str, password: str | None,
     except Exception:
         return False
 
+def _extract_lz4(filepath: str, dest: str, progress_cb=None,
+                 cancel_check=None, proc_holder=None) -> bool:
+    """LZ4 解压: lz4.exe -d input output"""
+    exe = _find_lz4()
+    if not exe:
+        return False
+    try:
+        # 输出文件名: 去掉 .lz4 后缀, 没有则加 .out
+        base = filepath
+        if base.lower().endswith(".lz4"):
+            base = base[:-4]
+        else:
+            base = base + ".out"
+        out_path = os.path.join(dest, os.path.basename(base))
+        # 检查同名输出是否已存在 (lz4 拒绝覆盖)
+        if os.path.exists(out_path):
+            os.unlink(out_path)
+        proc = subprocess.Popen(
+            [exe, "-d", filepath, out_path],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if proc_holder is not None:
+            proc_holder(proc)
+        # 读取输出 (lz4 有进度)
+        last_pct = -1
+        remainder = b""
+        while True:
+            if cancel_check and cancel_check():
+                proc.kill()
+                proc.wait()
+                return False
+            chunk = proc.stdout.read(8192)
+            if not chunk:
+                break
+            data = remainder + chunk
+            *lines, remainder = data.replace(b"\r", b"\n").split(b"\n")
+            for line_bytes in lines:
+                line = line_bytes.decode("utf-8", errors="replace")
+                m = re.search(r'(\d{1,3})\s*MiB', line)
+                if m and progress_cb:
+                    pct = int(m.group(1))
+                    if pct != last_pct:
+                        progress_cb(min(pct, 100))
+                        last_pct = pct
+        proc.wait(timeout=600)
+        return proc.returncode == 0 and os.path.isfile(out_path)
+    except Exception:
+        return False
+
 def _extract_zip(filepath: str, dest: str, passwords: list[str],
                  progress_cb=None, cancel_check=None, proc_holder=None) -> tuple[bool, str | None]:
     """(成功, 使用的密码或None=无密码). progress_cb(percent: int) 可选"""
     exe = _find_7z()
     is_appended = _has_appended_zip(filepath)
+
+    # LZ4 → 专用工具
+    if archive_type(filepath) == "LZ4":
+        ok = _extract_lz4(filepath, dest, progress_cb, cancel_check, proc_holder)
+        return (ok, None) if ok else (False, None)
 
     # 尾部追加 ZIP → 切出数据用 7z
     if is_appended:
@@ -349,14 +472,20 @@ class DecompressorGUI:
         # 关闭时清理
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def _set_input_file(self, filepath: str):
-        """设置输入文件并自动推导输出目录"""
-        self.file_var.set(filepath)
-        # 输出目录: {输入文件所在目录}/{输入文件名(去后缀)}/
+    def _derive_output_dir(self, filepath: str) -> str:
+        """推导输出目录: 输入文件同目录 + 文件名(去后缀)。
+        无扩展名或与输入文件同名时加 _解压 后缀"""
         parent = os.path.dirname(filepath)
         stem = Path(filepath).stem
         out_dir = os.path.join(parent, stem)
-        self.out_var.set(out_dir)
+        if os.path.isfile(out_dir):
+            out_dir = os.path.join(parent, stem + "_解压")
+        return out_dir
+
+    def _set_input_file(self, filepath: str):
+        """设置输入文件并自动推导输出目录"""
+        self.file_var.set(filepath)
+        self.out_var.set(self._derive_output_dir(filepath))
         # 更新拖拽区域显示
         fname = os.path.basename(filepath)
         self.drop_label.configure(text=f"📄 {fname}")
@@ -427,6 +556,26 @@ class DecompressorGUI:
         self._add_context_menu(self.pwd_text)
         self._add_context_menu(self.out_entry)
 
+        # ── 历史密码行 ──
+        hist_frame = tk.Frame(self.root, bg=BG)
+        hist_frame.pack(fill="x", padx=20, pady=(2, 4))
+        self.history_passwords = _load_password_cache()
+        self.history_var = tk.StringVar()
+        self.history_combo = ttk.Combobox(hist_frame, textvariable=self.history_var,
+                                           values=self.history_passwords,
+                                           font=("Consolas", 9), state="readonly",
+                                           width=28)
+        self.history_combo.pack(side="left")
+        self.history_combo.bind("<<ComboboxSelected>>", self._history_selected)
+        tk.Button(hist_frame, text="加入历史", command=self._add_current_pwd,
+                  bg=BTN_BG, fg=FG, relief="flat", cursor="hand2",
+                  font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(6, 0))
+        self.use_history_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(hist_frame, text="使用历史密码", variable=self.use_history_var,
+                       bg=BG, fg=FG, selectcolor=SURFACE, activebackground=BG,
+                       activeforeground=FG, font=("Microsoft YaHei UI", 9),
+                       cursor="hand2").pack(side="left", padx=(8, 0))
+
         # ── 按钮 ──
         btn_frame = tk.Frame(self.root, bg=BG)
         btn_frame.pack(fill="x", padx=20, pady=8)
@@ -478,6 +627,21 @@ class DecompressorGUI:
         self.status_var.set(msg)
 
     # ── 交互 ──────────────────────────────────────────────────
+
+    def _history_selected(self, event=None):
+        """选中历史密码 → 填入密码框"""
+        pwd = self.history_var.get().strip()
+        if pwd:
+            self.pwd_text.insert("end", pwd + "\n")
+
+    def _add_current_pwd(self):
+        """把密码框当前内容加入历史"""
+        pwds = [p.strip() for p in self.pwd_text.get("1.0", "end").splitlines() if p.strip()]
+        for p in pwds:
+            _add_manual_password(p)
+        self.history_passwords = _load_password_cache()
+        self.history_combo.configure(values=self.history_passwords)
+        self._log(f"🔑 已加入历史: {len(pwds)} 个密码")
 
     def _browse_file(self):
         path = filedialog.askopenfilename(title="选择要解压的文件")
@@ -574,7 +738,7 @@ class DecompressorGUI:
 
             # 规则1: 只有1个文件 → 直接解压它
             if len(items) == 1:
-                self.out_var.set(os.path.join(filepath, Path(items[0]).stem))
+                self.out_var.set(self._derive_output_dir(items[0]))
                 self.file_var.set(items[0])
                 # 递归: 单文件流程
                 filepath = items[0]
@@ -588,7 +752,7 @@ class DecompressorGUI:
                         [f for f in all_files if _SPLIT_RE.search(f.name)],
                         key=lambda f: f.name
                     )[0]
-                    self.out_var.set(os.path.join(filepath, Path(str(first)).stem))
+                    self.out_var.set(self._derive_output_dir(str(first)))
                     self.file_var.set(str(first))
                     filepath = str(first)
                     # fall through to single-file path
@@ -604,12 +768,23 @@ class DecompressorGUI:
 
         out_dir = self.out_var.get().strip()
         if not out_dir:
-            parent = os.path.dirname(filepath)
-            stem = Path(filepath).stem
-            out_dir = os.path.join(parent, stem)
+            out_dir = self._derive_output_dir(filepath)
             self.out_var.set(out_dir)
 
+        # 清理该输出目录的历史残留临时目录 (上次强杀/崩溃留下的)
+        out_parent = os.path.dirname(out_dir)
+        out_base = os.path.basename(out_dir)
+        if os.path.isdir(out_parent):
+            for d in os.listdir(out_parent):
+                if d.startswith(out_base + "_temp_L"):
+                    shutil.rmtree(os.path.join(out_parent, d), ignore_errors=True)
+
         passwords = [p.strip() for p in self.pwd_text.get("1.0", "end").splitlines() if p.strip()]
+        # 勾选"使用历史密码"时追加历史 (去重, 用户输入优先)
+        if self.use_history_var.get():
+            for p in self.history_passwords:
+                if p not in passwords:
+                    passwords.append(p)
 
         self._cancelled = False
         self.temp_dirs.clear()
@@ -625,7 +800,7 @@ class DecompressorGUI:
         self._log(f"📦 递归解压器")
         self._log(f"   输入: {filepath}")
         self._log(f"   输出: {out_dir}")
-        self._log(f"   密码: {len(passwords)} 个")
+        self._log(f"   密码: {len(passwords)} 个" + (" (含历史)" if self.use_history_var.get() else ""))
         self._log(f"{'='*50}")
 
         threading.Thread(target=self._run, args=(filepath, out_dir, passwords), daemon=True).start()
@@ -673,6 +848,9 @@ class DecompressorGUI:
                 ])
 
                 tmpdir = str(final_output) + f"_temp_L{layers}"
+                # 清理上次残留的同名目录 (强杀/崩溃时 finally 未执行)
+                if os.path.exists(tmpdir):
+                    shutil.rmtree(tmpdir, ignore_errors=True)
                 os.makedirs(tmpdir, exist_ok=True)
                 self.temp_dirs.append(tmpdir)
 
@@ -721,6 +899,8 @@ class DecompressorGUI:
                     self._ui(lambda p=used_pwd: self._log(f"│ ✓ 密码: {p}"))
                     if used_pwd not in known:
                         known.insert(0, used_pwd)
+                    # 记录到历史缓存 (局部性: 内层大概率同密码)
+                    _save_password_to_cache(used_pwd)
                 else:
                     self._ui(lambda: self._log("│ ✓ 无密码"))
 
@@ -893,15 +1073,24 @@ class DecompressorGUI:
         self.progress.configure(value=pct)
 
     def _ask_delete_original(self, filepath: str):
-        """解压成功后询问是否删除原文件"""
+        """解压成功后询问是否删除原文件 (分卷时删除整个分卷家族)"""
         fname = os.path.basename(filepath)
-        if messagebox.askyesno("解压完成", f"是否删除原文件?\n\n{fname}", parent=self.root):
+        if not messagebox.askyesno("解压完成", f"是否删除原文件?\n\n{fname}", parent=self.root):
+            return
+        targets = [filepath]
+        # 分卷家族: xxx.001/002, xxx.part1.rar/part2.rar, xxx.r00/r01, xxx.7z.001
+        if _SPLIT_RE.search(fname):
+            base = _SPLIT_RE.sub("", fname)
+            d = os.path.dirname(filepath)
+            for f in os.listdir(d):
+                if f.startswith(base) and _SPLIT_RE.search(f):
+                    targets.append(os.path.join(d, f))
+        for t in targets:
             try:
-                os.remove(filepath)
-                self._log(f"🗑 已删除原文件: {fname}")
-                self._set_status(f"完成 — 原文件已删除")
+                os.remove(t)
+                self._log(f"🗑 已删除: {os.path.basename(t)}")
             except Exception as e:
-                self._log(f"⚠ 删除原文件失败: {e}")
+                self._log(f"⚠ 删除失败: {os.path.basename(t)} ({e})")
 
     def run(self):
         self.root.mainloop()

@@ -19,3 +19,15 @@ venv/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# 外部工具二进制 (用户自行放置)
+lz4.exe
+
+# 本地密码缓存 (含个人密码, 不入库)
+password_cache.json
+
+# 外部工具二进制 (用户自行放置)
+lz4.exe
+
+# 本地密码缓存 (含个人密码, 不入库)
+password_cache.json
